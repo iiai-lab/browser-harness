@@ -734,11 +734,70 @@ def _chrome_running():
         return False
 
 
+def _open_inspect_allowed():
+    """True when a human is present to tick the checkbox we're about to show.
+
+    BH_OPEN_INSPECT=1/0 forces it on/off; otherwise a tty on stdout or stderr is
+    the signal — someone is reading the output we're about to explain. stdin is
+    not a signal: the script arrives on stdin via heredoc/pipe even in a live
+    terminal. Scheduled runs (cron, CI, agent subprocesses) capture both streams,
+    have nobody to click, and would collect one dead page per run.
+    """
+    import sys
+    override = (os.environ.get("BH_OPEN_INSPECT") or "").strip().lower()
+    if override in ("1", "true", "yes"):
+        return True
+    if override in ("0", "false", "no"):
+        return False
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is not None and stream.isatty():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _windows_chrome_exe():
+    """Path to chrome.exe, or None. Honors BH_CHROME_PATH / CHROME_PATH first."""
+    import shutil
+    for key in ("BH_CHROME_PATH", "CHROME_PATH"):
+        raw = (os.environ.get(key) or "").strip()
+        if not raw:
+            continue
+        try:
+            p = Path(raw).expanduser()
+            if p.is_file():
+                return str(p)
+        except OSError:
+            continue
+    found = shutil.which("chrome") or shutil.which("chrome.exe")
+    if found:
+        return found
+    for base in (
+        os.environ.get("PROGRAMFILES"),
+        os.environ.get("PROGRAMFILES(X86)"),
+        os.environ.get("LOCALAPPDATA"),
+    ):
+        if not base:
+            continue
+        try:
+            p = Path(base) / "Google" / "Chrome" / "Application" / "chrome.exe"
+            if p.is_file():
+                return str(p)
+        except OSError:
+            continue
+    return None
+
+
 def _open_chrome_inspect():
     """Open chrome://inspect/#remote-debugging so the user can tick the checkbox."""
     import platform, subprocess, webbrowser
     url = "chrome://inspect/#remote-debugging"
-    if platform.system() == "Darwin":
+    if not _open_inspect_allowed():
+        return
+    system = platform.system()
+    if system == "Darwin":
         try:
             subprocess.run([
                 "osascript",
@@ -748,6 +807,17 @@ def _open_chrome_inspect():
             return
         except Exception:
             pass
+    elif system == "Windows":
+        # Windows registers no handler for the chrome: scheme, so ShellExecute —
+        # what webbrowser falls back to here — can only raise "You'll need a new
+        # app to open this chrome link". Chrome itself accepts the URL as argv.
+        exe = _windows_chrome_exe()
+        if exe:
+            try:
+                subprocess.Popen([exe, url], close_fds=True)
+            except Exception:
+                pass
+        return
     try:
         webbrowser.open(url, new=2)
     except Exception:

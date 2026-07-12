@@ -674,3 +674,114 @@ def test_process_start_time_returns_none_for_invalid_pid():
         )
     # 2**31 - 1 is the largest pid_t; in practice no live process at that PID.
     assert admin._process_start_time((1 << 31) - 1) is None
+
+
+# --- _open_chrome_inspect: never hand a chrome: URL to the OS shell ---
+
+class _Stream:
+    def __init__(self, tty):
+        self._tty = tty
+
+    def isatty(self):
+        return self._tty
+
+
+def _spy_open_calls(monkeypatch):
+    """Record every way _open_chrome_inspect could try to open a URL."""
+    import subprocess, webbrowser
+    calls = {"webbrowser": [], "popen": [], "run": []}
+    monkeypatch.setattr(webbrowser, "open", lambda url, **kw: calls["webbrowser"].append(url))
+    monkeypatch.setattr(subprocess, "Popen", lambda argv, **kw: calls["popen"].append(argv))
+    monkeypatch.setattr(subprocess, "run", lambda argv, **kw: calls["run"].append(argv))
+    return calls
+
+
+def test_open_chrome_inspect_is_silent_when_unattended(monkeypatch):
+    """Cron/CI runs have nobody to tick the checkbox. Opening anything there is
+    noise — on Windows the chrome: scheme has no shell handler, so it raises a
+    modal app-picker on every scheduled run."""
+    import sys
+    monkeypatch.delenv("BH_OPEN_INSPECT", raising=False)
+    for name in ("stdin", "stdout", "stderr"):
+        monkeypatch.setattr(sys, name, _Stream(tty=False))
+    calls = _spy_open_calls(monkeypatch)
+
+    admin._open_chrome_inspect()
+
+    assert calls == {"webbrowser": [], "popen": [], "run": []}, (
+        f"unattended run must not open anything; got {calls}"
+    )
+
+
+def test_open_chrome_inspect_ignores_a_tty_stdin(monkeypatch):
+    """The script itself arrives on stdin, so a tty there says nothing about
+    whether a human is watching the output. Only stdout/stderr do."""
+    import sys
+    monkeypatch.delenv("BH_OPEN_INSPECT", raising=False)
+    monkeypatch.setattr(sys, "stdin", _Stream(tty=True))
+    for name in ("stdout", "stderr"):
+        monkeypatch.setattr(sys, name, _Stream(tty=False))
+    calls = _spy_open_calls(monkeypatch)
+
+    admin._open_chrome_inspect()
+
+    assert calls == {"webbrowser": [], "popen": [], "run": []}, (
+        f"captured output means nobody is watching; got {calls}"
+    )
+
+
+def test_open_chrome_inspect_on_windows_passes_url_to_chrome_argv(monkeypatch):
+    """Windows has no handler for the chrome: scheme, so ShellExecute (what
+    webbrowser falls back to) can never work. Chrome opens it as an argv."""
+    import platform
+    monkeypatch.setenv("BH_OPEN_INSPECT", "1")
+    monkeypatch.setattr(platform, "system", lambda: "Windows")
+    monkeypatch.setattr(admin, "_windows_chrome_exe", lambda: r"C:\chrome.exe")
+    calls = _spy_open_calls(monkeypatch)
+
+    admin._open_chrome_inspect()
+
+    assert calls["webbrowser"] == [], "must never ShellExecute a chrome: URL on Windows"
+    assert calls["popen"] == [[r"C:\chrome.exe", "chrome://inspect/#remote-debugging"]]
+
+
+def test_open_chrome_inspect_on_windows_without_chrome_stays_silent(monkeypatch):
+    """No Chrome found → still no ShellExecute fallback, or the popup is back."""
+    import platform
+    monkeypatch.setenv("BH_OPEN_INSPECT", "1")
+    monkeypatch.setattr(platform, "system", lambda: "Windows")
+    monkeypatch.setattr(admin, "_windows_chrome_exe", lambda: None)
+    calls = _spy_open_calls(monkeypatch)
+
+    admin._open_chrome_inspect()
+
+    assert calls == {"webbrowser": [], "popen": [], "run": []}, (
+        f"no Chrome binary must mean no open attempt at all; got {calls}"
+    )
+
+
+def test_open_chrome_inspect_env_override_off_beats_a_tty(monkeypatch):
+    import sys
+    monkeypatch.setenv("BH_OPEN_INSPECT", "0")
+    for name in ("stdout", "stderr"):
+        monkeypatch.setattr(sys, name, _Stream(tty=True))
+    calls = _spy_open_calls(monkeypatch)
+
+    admin._open_chrome_inspect()
+
+    assert calls == {"webbrowser": [], "popen": [], "run": []}
+
+
+def test_open_chrome_inspect_opens_for_an_interactive_posix_user(monkeypatch):
+    """The interactive nudge still works where the shell can handle it."""
+    import platform, sys
+    monkeypatch.delenv("BH_OPEN_INSPECT", raising=False)
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
+    monkeypatch.setattr(sys, "stdin", _Stream(tty=False))
+    for name in ("stdout", "stderr"):
+        monkeypatch.setattr(sys, name, _Stream(tty=True))
+    calls = _spy_open_calls(monkeypatch)
+
+    admin._open_chrome_inspect()
+
+    assert calls["webbrowser"] == ["chrome://inspect/#remote-debugging"]
