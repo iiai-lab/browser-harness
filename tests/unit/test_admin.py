@@ -691,7 +691,7 @@ def _spy_open_calls(monkeypatch):
     import subprocess, webbrowser
     calls = {"webbrowser": [], "popen": [], "run": []}
     monkeypatch.setattr(webbrowser, "open", lambda url, **kw: calls["webbrowser"].append(url))
-    monkeypatch.setattr(subprocess, "Popen", lambda argv, **kw: calls["popen"].append(argv))
+    monkeypatch.setattr(subprocess, "Popen", lambda argv, **kw: calls["popen"].append((argv, kw)))
     monkeypatch.setattr(subprocess, "run", lambda argv, **kw: calls["run"].append(argv))
     return calls
 
@@ -741,8 +741,15 @@ def test_open_chrome_inspect_on_windows_passes_url_to_chrome_argv(monkeypatch):
 
     admin._open_chrome_inspect()
 
+    import subprocess
     assert calls["webbrowser"] == [], "must never ShellExecute a chrome: URL on Windows"
-    assert calls["popen"] == [[r"C:\chrome.exe", "chrome://inspect/#remote-debugging"]]
+    assert len(calls["popen"]) == 1
+    argv, kwargs = calls["popen"][0]
+    assert argv == [r"C:\chrome.exe", "chrome://inspect/#remote-debugging"]
+    # Chrome must not inherit our pipes: a parent reading stdout to EOF would
+    # otherwise block until the browser exits.
+    for stream in ("stdin", "stdout", "stderr"):
+        assert kwargs.get(stream) is subprocess.DEVNULL, f"{stream} must be DEVNULL, got {kwargs}"
 
 
 def test_open_chrome_inspect_on_windows_without_chrome_stays_silent(monkeypatch):
@@ -785,3 +792,48 @@ def test_open_chrome_inspect_opens_for_an_interactive_posix_user(monkeypatch):
     admin._open_chrome_inspect()
 
     assert calls["webbrowser"] == ["chrome://inspect/#remote-debugging"]
+
+
+# --- _windows_chrome_exe ---
+
+def test_windows_chrome_exe_prefers_env_override(monkeypatch, tmp_path):
+    exe = tmp_path / "chrome.exe"
+    exe.write_bytes(b"")
+    monkeypatch.setenv("BH_CHROME_PATH", str(exe))
+    monkeypatch.setenv("PROGRAMFILES", str(tmp_path / "nowhere"))
+
+    assert admin._windows_chrome_exe() == str(exe)
+
+
+def test_windows_chrome_exe_skips_a_directory_and_a_bad_tilde(monkeypatch, tmp_path):
+    """A dir, or a ~user that has no home (RuntimeError, not OSError), must fall
+    through rather than crash ensure_daemon's retry path."""
+    (tmp_path / "chrome.exe").mkdir()
+    monkeypatch.setenv("BH_CHROME_PATH", str(tmp_path / "chrome.exe"))
+    monkeypatch.setenv("CHROME_PATH", "~nosuchuser-really/chrome.exe")
+    for var in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+        monkeypatch.delenv(var, raising=False)
+
+    assert admin._windows_chrome_exe() is None
+
+
+def test_windows_chrome_exe_falls_back_to_standard_install_dir(monkeypatch, tmp_path):
+    installed = tmp_path / "Google" / "Chrome" / "Application" / "chrome.exe"
+    installed.parent.mkdir(parents=True)
+    installed.write_bytes(b"")
+    for var in ("BH_CHROME_PATH", "CHROME_PATH"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.delenv("PROGRAMFILES", raising=False)
+    monkeypatch.delenv("PROGRAMFILES(X86)", raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
+    assert admin._windows_chrome_exe() == str(installed)
+
+
+def test_windows_chrome_exe_returns_none_when_chrome_is_absent(monkeypatch, tmp_path):
+    for var in ("BH_CHROME_PATH", "CHROME_PATH"):
+        monkeypatch.delenv(var, raising=False)
+    for var in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+        monkeypatch.setenv(var, str(tmp_path / "empty"))
+
+    assert admin._windows_chrome_exe() is None

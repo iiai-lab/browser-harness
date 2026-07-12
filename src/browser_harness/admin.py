@@ -759,21 +759,22 @@ def _open_inspect_allowed():
 
 
 def _windows_chrome_exe():
-    """Path to chrome.exe, or None. Honors BH_CHROME_PATH / CHROME_PATH first."""
-    import shutil
+    """Path to chrome.exe, or None. Honors BH_CHROME_PATH / CHROME_PATH first.
+
+    No shutil.which() fallback: Chrome registers an App Paths key rather than a
+    PATH entry, so which() would mostly find a stray chrome.exe in the cwd — and
+    this path spawns whatever it returns.
+    """
     for key in ("BH_CHROME_PATH", "CHROME_PATH"):
         raw = (os.environ.get(key) or "").strip()
         if not raw:
             continue
         try:
-            p = Path(raw).expanduser()
+            p = Path(raw).expanduser()  # a bad ~user raises RuntimeError, not OSError
             if p.is_file():
                 return str(p)
-        except OSError:
+        except Exception:
             continue
-    found = shutil.which("chrome") or shutil.which("chrome.exe")
-    if found:
-        return found
     for base in (
         os.environ.get("PROGRAMFILES"),
         os.environ.get("PROGRAMFILES(X86)"),
@@ -785,7 +786,7 @@ def _windows_chrome_exe():
             p = Path(base) / "Google" / "Chrome" / "Application" / "chrome.exe"
             if p.is_file():
                 return str(p)
-        except OSError:
+        except Exception:
             continue
     return None
 
@@ -814,8 +815,15 @@ def _open_chrome_inspect():
         exe = _windows_chrome_exe()
         if exe:
             try:
-                subprocess.Popen([exe, url], close_fds=True)
-            except Exception:
+                # DEVNULL, or a cold-starting Chrome inherits our stdout pipe and
+                # a parent reading it to EOF waits for the browser to exit.
+                subprocess.Popen(
+                    [exe, url],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except OSError:
                 pass
         return
     try:

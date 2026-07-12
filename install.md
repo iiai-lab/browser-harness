@@ -41,6 +41,11 @@ In Chrome:
 
 The checkbox and popup require the user.
 
+The harness opens that page for you only when someone is watching — stdout or
+stderr is a tty. Scheduled runs (cron, CI, agents whose output is captured) just
+print the instruction, so they never pile up dead tabs. `BH_OPEN_INSPECT=1`
+forces the page open, `BH_OPEN_INSPECT=0` never opens it.
+
 ## Cloud Browsers
 
 Cloud is optional. Local Chrome does not need a Browser Use API key.
