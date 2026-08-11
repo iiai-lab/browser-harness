@@ -75,26 +75,37 @@ def test_new_tab_reuses_chrome_newtab_without_creating_another_target():
     assert not any(method == "Target.createTarget" for method, _kwargs in calls)
 
 
+def _fake_send(req):
+    if req.get("meta") == "current_tab":
+        return {"targetId": "old-page", "url": "https://before.example", "title": "Before"}
+    if req.get("meta") == "set_session":
+        return {"session_id": req["session_id"]}
+    return {}
+
+
 def test_new_tab_switches_to_the_page_under_a_tab_target():
     # Chrome 126+ answers createTarget with a *tab* target, which has no Page
     # domain: attaching to it and sending Page.navigate fails with -32601.
     # The page appears underneath the tab a moment later.
     calls = []
-    page_sets = [
-        {"targetInfos": [{"targetId": "old-page", "type": "page"}]},
-        {"targetInfos": [{"targetId": "old-page", "type": "page"}]},
-        {"targetInfos": [
-            {"targetId": "old-page", "type": "page"},
-            {"targetId": "child-page", "type": "page"},
-        ]},
-    ]
+    box = {}
 
     def fake_cdp(method, **kwargs):
         calls.append((method, kwargs))
-        if method == "Target.getTargets":
-            return page_sets.pop(0) if len(page_sets) > 1 else page_sets[0]
         if method == "Target.createTarget":
+            box["marker"] = kwargs["url"]
+            # 1回目はまだ現れていない。2回目に印の付いたページが出る。
+            box["queue"] = [
+                {"targetInfos": [{"targetId": "old-page", "type": "page", "url": "https://before.example"}]},
+                {"targetInfos": [
+                    {"targetId": "old-page", "type": "page", "url": "https://before.example"},
+                    {"targetId": "child-page", "type": "page", "url": box["marker"]},
+                ]},
+            ]
             return {"targetId": "tab-target"}
+        if method == "Target.getTargets":
+            q = box["queue"]
+            return q.pop(0) if len(q) > 1 else q[0]
         if method == "Target.getTargetInfo":
             return {"targetInfo": {"targetId": kwargs["targetId"], "type": "tab"}}
         if method == "Target.attachToTarget":
@@ -103,23 +114,48 @@ def test_new_tab_switches_to_the_page_under_a_tab_target():
             return {"frameId": "frame-1"}
         return {}
 
-    def fake_send(req):
-        if req.get("meta") == "current_tab":
-            return {"targetId": "old-page", "url": "https://before.example", "title": "Before"}
-        if req.get("meta") == "set_session":
-            return {"session_id": req["session_id"]}
-        return {}
-
     with patch("browser_harness.helpers.cdp", side_effect=fake_cdp), \
-         patch("browser_harness.helpers._send", side_effect=fake_send), \
+         patch("browser_harness.helpers._send", side_effect=_fake_send), \
          patch("browser_harness.helpers.time.sleep", lambda _s: None):
         assert helpers.new_tab("https://example.com") == "child-page"
 
+    assert box["marker"].startswith("about:blank#bh-"), "印の無い url では自分のページを見分けられない"
     assert ("Target.attachToTarget", {"targetId": "child-page", "flatten": True}) in calls
     assert not any(
         method == "Target.attachToTarget" and kwargs.get("targetId") == "tab-target"
         for method, kwargs in calls
     ), "Page を持たない tab ターゲットへ attach してはいけない"
+
+
+def test_new_tab_ignores_a_page_it_did_not_create():
+    # 同じ瞬間に誰かが別のタブを開いても、印の付いた自分のページだけを掴む。
+    calls = []
+    box = {}
+
+    def fake_cdp(method, **kwargs):
+        calls.append((method, kwargs))
+        if method == "Target.createTarget":
+            box["marker"] = kwargs["url"]
+            return {"targetId": "tab-target"}
+        if method == "Target.getTargets":
+            return {"targetInfos": [
+                {"targetId": "old-page", "type": "page", "url": "https://before.example"},
+                # 別の誰かが同時に開いた空タブ。印が無いので選んではいけない。
+                {"targetId": "someone-elses-page", "type": "page", "url": "about:blank"},
+                {"targetId": "child-page", "type": "page", "url": box["marker"]},
+            ]}
+        if method == "Target.getTargetInfo":
+            return {"targetInfo": {"targetId": kwargs["targetId"], "type": "tab"}}
+        if method == "Target.attachToTarget":
+            return {"sessionId": f"session-{kwargs['targetId']}"}
+        if method == "Page.navigate":
+            return {"frameId": "frame-1"}
+        return {}
+
+    with patch("browser_harness.helpers.cdp", side_effect=fake_cdp), \
+         patch("browser_harness.helpers._send", side_effect=_fake_send), \
+         patch("browser_harness.helpers.time.sleep", lambda _s: None):
+        assert helpers.new_tab("https://example.com") == "child-page"
 
 
 def test_new_tab_keeps_using_a_page_target_as_is():
@@ -140,39 +176,55 @@ def test_new_tab_keeps_using_a_page_target_as_is():
             return {"frameId": "frame-1"}
         return {}
 
-    def fake_send(req):
-        if req.get("meta") == "current_tab":
-            return {"targetId": "old-page", "url": "https://before.example", "title": "Before"}
-        if req.get("meta") == "set_session":
-            return {"session_id": req["session_id"]}
-        return {}
-
     with patch("browser_harness.helpers.cdp", side_effect=fake_cdp), \
-         patch("browser_harness.helpers._send", side_effect=fake_send):
+         patch("browser_harness.helpers._send", side_effect=_fake_send):
         assert helpers.new_tab("https://example.com") == "blank-page"
 
     assert ("Target.attachToTarget", {"targetId": "blank-page", "flatten": True}) in calls
 
 
-def test_new_tab_closes_the_tab_target_when_navigation_fails():
-    # tab を閉じれば配下の page も閉じる。page だけ閉じると tab が残り得る。
+def test_new_tab_fails_and_cleans_up_when_the_page_never_appears():
+    # tab を返したまま黙って成功にすると、以後の Page.* が全部 -32601 になる。
+    # ここで失敗させ、作った tab を必ず片付ける。
     calls = []
-    # createTarget の前は old-page だけ。後から child-page が現れる — この差分が
-    # 無いと tid が tab-target のままになり、閉じる対象の検査が空振りする。
-    page_sets = [
-        {"targetInfos": [{"targetId": "old-page", "type": "page"}]},
-        {"targetInfos": [
-            {"targetId": "old-page", "type": "page"},
-            {"targetId": "child-page", "type": "page"},
-        ]},
-    ]
 
     def fake_cdp(method, **kwargs):
         calls.append((method, kwargs))
         if method == "Target.getTargets":
-            return page_sets.pop(0) if len(page_sets) > 1 else page_sets[0]
+            return {"targetInfos": [{"targetId": "old-page", "type": "page", "url": "https://before.example"}]}
         if method == "Target.createTarget":
             return {"targetId": "tab-target"}
+        if method == "Target.getTargetInfo":
+            return {"targetInfo": {"targetId": kwargs["targetId"], "type": "tab"}}
+        if method == "Target.attachToTarget":
+            return {"sessionId": f"session-{kwargs['targetId']}"}
+        return {}
+
+    with patch("browser_harness.helpers.cdp", side_effect=fake_cdp), \
+         patch("browser_harness.helpers._send", side_effect=_fake_send), \
+         patch("browser_harness.helpers.time.sleep", lambda _s: None), \
+         pytest.raises(RuntimeError, match="never exposed its page"):
+        helpers.new_tab("https://example.com")
+
+    assert ("Target.closeTarget", {"targetId": "tab-target"}) in calls
+    assert not any(method == "Page.navigate" for method, _kwargs in calls)
+
+
+def test_new_tab_closes_what_it_created_when_navigation_fails():
+    # 閉じるのは自分が作ったものだけ。ページを閉じれば、その tab も一緒に消える。
+    calls = []
+    box = {}
+
+    def fake_cdp(method, **kwargs):
+        calls.append((method, kwargs))
+        if method == "Target.createTarget":
+            box["marker"] = kwargs["url"]
+            return {"targetId": "tab-target"}
+        if method == "Target.getTargets":
+            return {"targetInfos": [
+                {"targetId": "old-page", "type": "page", "url": "https://before.example"},
+                {"targetId": "child-page", "type": "page", "url": box["marker"]},
+            ]}
         if method == "Target.getTargetInfo":
             return {"targetInfo": {"targetId": kwargs["targetId"], "type": "tab"}}
         if method == "Target.attachToTarget":
@@ -181,20 +233,15 @@ def test_new_tab_closes_the_tab_target_when_navigation_fails():
             raise RuntimeError("navigation failed")
         return {}
 
-    def fake_send(req):
-        if req.get("meta") == "current_tab":
-            return {"targetId": "old-page", "url": "https://before.example", "title": "Before"}
-        if req.get("meta") == "set_session":
-            return {"session_id": req["session_id"]}
-        return {}
-
     with patch("browser_harness.helpers.cdp", side_effect=fake_cdp), \
-         patch("browser_harness.helpers._send", side_effect=fake_send), \
+         patch("browser_harness.helpers._send", side_effect=_fake_send), \
          patch("browser_harness.helpers.time.sleep", lambda _s: None), \
          pytest.raises(RuntimeError, match="navigation failed"):
         helpers.new_tab("https://example.com")
 
-    assert ("Target.closeTarget", {"targetId": "tab-target"}) in calls
+    closed = [kwargs["targetId"] for method, kwargs in calls if method == "Target.closeTarget"]
+    assert "child-page" in closed, "作ったページを閉じずに抜けてはいけない"
+    assert "old-page" not in closed, "他人のタブを閉じてはいけない"
 
 
 def test_new_tab_closes_created_blank_and_restores_previous_when_navigation_fails():

@@ -305,34 +305,44 @@ def switch_tab(target):
     _mark_tab()
     return sid
 
-def _page_target_ids():
-    """Ids of every page target the browser currently exposes."""
-    infos = cdp("Target.getTargets").get("targetInfos") or []
-    return {t.get("targetId") for t in infos if t.get("type") == "page" and t.get("targetId")}
+def _blank_marker():
+    """A one-off about:blank URL used to recognise the page we just created."""
+    return f"about:blank#bh-{os.urandom(6).hex()}"
 
 
-def _resolve_page_target(target_id, before, attempts=20, delay=0.1):
+def _resolve_page_target(created_id, marker, attempts=20, delay=0.1):
     """Turn a Target.createTarget id into the id of a target that has Page.
 
     Chrome 126+ (including the Chromium-derived Android browsers we drive)
     answers createTarget with a *tab* target. A tab has no Page domain, so
     attaching to it and sending Page.navigate fails with
-    -32601 "'Page.navigate' wasn't found". The real page shows up underneath
-    that tab a moment later, so diff the page set around the call and take the
-    one that appeared. Older browsers answer with a page and skip all of this.
+    -32601 "'Page.navigate' wasn't found". The real page appears underneath the
+    tab a moment later.
+
+    The marker url is what makes the match safe: only our page carries it, so a
+    tab someone else opens at the same moment is never mistaken for ours.
+    Browsers that still answer with a page return on the first check.
     """
     try:
-        info = cdp("Target.getTargetInfo", targetId=target_id).get("targetInfo") or {}
+        info = cdp("Target.getTargetInfo", targetId=created_id).get("targetInfo") or {}
     except Exception:
-        return target_id
+        # Can't tell what it is; assume the old page-shaped answer rather than
+        # failing a call that would have worked.
+        return created_id
     if info.get("type") != "tab":
-        return target_id
+        return created_id
     for _ in range(attempts):
-        fresh = _page_target_ids() - before
-        if fresh:
-            return sorted(fresh)[0]
+        for t in cdp("Target.getTargets").get("targetInfos") or []:
+            if t.get("type") == "page" and (t.get("url") or "") == marker and t.get("targetId"):
+                return t["targetId"]
         time.sleep(delay)
-    return target_id
+    # Returning the tab here would hand back a target where every Page.* call
+    # fails — the exact bug this function exists to prevent. Fail loudly so the
+    # caller's cleanup runs.
+    raise RuntimeError(
+        f"created tab target {created_id} never exposed its page ({marker}); "
+        "Page.* would fail against it"
+    )
 
 
 def new_tab(url="about:blank"):
@@ -352,20 +362,21 @@ def new_tab(url="about:blank"):
                 return cur.get("targetId") or cur.get("target_id")
         except Exception:
             pass
+    marker = _blank_marker()
+    created = cdp("Target.createTarget", url=marker)["targetId"]
+    tid = created
     try:
-        pages_before = _page_target_ids()
-    except Exception:
-        pages_before = set()
-    created = cdp("Target.createTarget", url="about:blank")["targetId"]
-    tid = _resolve_page_target(created, pages_before)
-    try:
+        # Inside the try: if the page never shows up we still have to clean up
+        # the tab we just created.
+        tid = _resolve_page_target(created, marker)
         switch_tab(tid)
         if url != "about:blank":
             goto_url(url)
     except Exception:
-        # Close the tab we created. On a tab/page split, closing the tab takes
-        # the page with it; closing only the page can leave the tab behind.
-        for stray in dict.fromkeys((created, tid)):
+        # Closing the page takes its tab with it (measured), so closing `tid` is
+        # enough in the normal case; `created` covers the tab whose page never
+        # appeared.
+        for stray in dict.fromkeys((tid, created)):
             try: cdp("Target.closeTarget", targetId=stray)
             except Exception: pass
         if previous and previous.get("targetId") and previous.get("targetId") != tid:
