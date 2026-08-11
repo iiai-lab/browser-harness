@@ -141,7 +141,12 @@ def test_new_tab_ignores_a_page_it_did_not_create():
             return {"targetInfos": [
                 {"targetId": "old-page", "type": "page", "url": "https://before.example"},
                 # 別の誰かが同時に開いた空タブ。印が無いので選んではいけない。
-                {"targetId": "someone-elses-page", "type": "page", "url": "about:blank"},
+                # 名前は child-page より前に来る。辞書順の先頭を採る実装だと
+                # こちらを掴んでしまうので、印で選んでいることの検査になる。
+                {"targetId": "a-foreign-page", "type": "page", "url": "about:blank"},
+                # 一覧に tab が出るブラウザもある。印は同じでも Page を持たない
+                # ので、型で弾けていないと元の -32601 に逆戻りする。
+                {"targetId": "tab-target", "type": "tab", "url": box["marker"]},
                 {"targetId": "child-page", "type": "page", "url": box["marker"]},
             ]}
         if method == "Target.getTargetInfo":
@@ -165,7 +170,12 @@ def test_new_tab_keeps_using_a_page_target_as_is():
     def fake_cdp(method, **kwargs):
         calls.append((method, kwargs))
         if method == "Target.getTargets":
-            return {"targetInfos": [{"targetId": "old-page", "type": "page"}]}
+            # 作った page がそのまま一覧に出る。url は about:blank のままで、
+            # marker の fragment を落とすブラウザも同じ形になる。
+            return {"targetInfos": [
+                {"targetId": "old-page", "type": "page", "url": "https://before.example"},
+                {"targetId": "blank-page", "type": "page", "url": "about:blank"},
+            ]}
         if method == "Target.createTarget":
             return {"targetId": "blank-page"}
         if method == "Target.getTargetInfo":
@@ -241,6 +251,9 @@ def test_new_tab_closes_what_it_created_when_navigation_fails():
 
     closed = [kwargs["targetId"] for method, kwargs in calls if method == "Target.closeTarget"]
     assert "child-page" in closed, "作ったページを閉じずに抜けてはいけない"
+    # 実機ではページを閉じれば tab も消えるが、消えないブラウザに当たったときに
+    # 空 tab が積み上がらないよう、作った tab も閉じにいく。
+    assert "tab-target" in closed, "作った tab も片付ける"
     assert "old-page" not in closed, "他人のタブを閉じてはいけない"
 
 
@@ -253,6 +266,12 @@ def test_new_tab_closes_created_blank_and_restores_previous_when_navigation_fail
             return {"targetInfo": {"targetId": "previous-target", "url": "https://before.example", "title": "Before"}}
         if method == "Target.createTarget":
             return {"targetId": "blank-target"}
+        if method == "Target.getTargets":
+            # createTarget が page で答えるブラウザ: その id がそのまま一覧に出る。
+            return {"targetInfos": [
+                {"targetId": "previous-target", "type": "page", "url": "https://before.example"},
+                {"targetId": "blank-target", "type": "page", "url": "about:blank"},
+            ]}
         if method == "Target.attachToTarget":
             return {"sessionId": f"session-{kwargs['targetId']}"}
         if method == "Page.navigate":
@@ -287,7 +306,11 @@ def test_new_tab_recovers_to_fallback_tab_when_previous_is_unavailable():
         if method == "Target.attachToTarget":
             return {"sessionId": f"session-{kwargs['targetId']}"}
         if method == "Target.getTargets":
-            return {"targetInfos": []}
+            # createTarget が page で答えるブラウザ。作った id がそのまま出る。
+            return {"targetInfos": [
+                {"targetId": "failed-target", "type": "page", "url": "about:blank"},
+                {"targetId": "fallback-target", "type": "page", "url": "about:blank"},
+            ]}
         if method == "Page.navigate":
             raise RuntimeError("navigation failed")
         return {}

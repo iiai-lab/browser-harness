@@ -320,20 +320,23 @@ def _resolve_page_target(created_id, marker, attempts=20, delay=0.1):
     tab a moment later.
 
     The marker url is what makes the match safe: only our page carries it, so a
-    tab someone else opens at the same moment is never mistaken for ours.
-    Browsers that still answer with a page return on the first check.
+    tab someone else opens at the same moment is never mistaken for ours. (A
+    random marker is not a proof of ownership — another CDP client that copied
+    the exact url could still be matched — but nothing in the protocol ties a
+    tab to its page, and 48 random bits make an accidental clash a non-event.)
+
+    Deliberately no "is it a tab?" check first: browsers that still answer with
+    a page find that same page by its marker on the first pass, and asking costs
+    a round trip that can fail on its own — treating that failure as "it must be
+    a page" is how a tab id slips through and breaks every later Page.* call.
     """
-    try:
-        info = cdp("Target.getTargetInfo", targetId=created_id).get("targetInfo") or {}
-    except Exception:
-        # Can't tell what it is; assume the old page-shaped answer rather than
-        # failing a call that would have worked.
-        return created_id
-    if info.get("type") != "tab":
-        return created_id
     for _ in range(attempts):
         for t in cdp("Target.getTargets").get("targetInfos") or []:
-            if t.get("type") == "page" and (t.get("url") or "") == marker and t.get("targetId"):
+            if t.get("type") != "page" or not t.get("targetId"):
+                continue
+            # createTarget が page で答えたブラウザは、その id がそのまま一覧に
+            # 出る。marker を頼らないので、url から fragment を落とす実装でも通る。
+            if t["targetId"] == created_id or (t.get("url") or "") == marker:
                 return t["targetId"]
         time.sleep(delay)
     # Returning the tab here would hand back a target where every Page.* call
