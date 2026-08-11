@@ -305,6 +305,36 @@ def switch_tab(target):
     _mark_tab()
     return sid
 
+def _page_target_ids():
+    """Ids of every page target the browser currently exposes."""
+    infos = cdp("Target.getTargets").get("targetInfos") or []
+    return {t.get("targetId") for t in infos if t.get("type") == "page" and t.get("targetId")}
+
+
+def _resolve_page_target(target_id, before, attempts=20, delay=0.1):
+    """Turn a Target.createTarget id into the id of a target that has Page.
+
+    Chrome 126+ (including the Chromium-derived Android browsers we drive)
+    answers createTarget with a *tab* target. A tab has no Page domain, so
+    attaching to it and sending Page.navigate fails with
+    -32601 "'Page.navigate' wasn't found". The real page shows up underneath
+    that tab a moment later, so diff the page set around the call and take the
+    one that appeared. Older browsers answer with a page and skip all of this.
+    """
+    try:
+        info = cdp("Target.getTargetInfo", targetId=target_id).get("targetInfo") or {}
+    except Exception:
+        return target_id
+    if info.get("type") != "tab":
+        return target_id
+    for _ in range(attempts):
+        fresh = _page_target_ids() - before
+        if fresh:
+            return sorted(fresh)[0]
+        time.sleep(delay)
+    return target_id
+
+
 def new_tab(url="about:blank"):
     # Always create blank, then goto: passing url to createTarget races with
     # attach, so the brief about:blank is "complete" by the time the caller
@@ -322,14 +352,22 @@ def new_tab(url="about:blank"):
                 return cur.get("targetId") or cur.get("target_id")
         except Exception:
             pass
-    tid = cdp("Target.createTarget", url="about:blank")["targetId"]
+    try:
+        pages_before = _page_target_ids()
+    except Exception:
+        pages_before = set()
+    created = cdp("Target.createTarget", url="about:blank")["targetId"]
+    tid = _resolve_page_target(created, pages_before)
     try:
         switch_tab(tid)
         if url != "about:blank":
             goto_url(url)
     except Exception:
-        try: cdp("Target.closeTarget", targetId=tid)
-        except Exception: pass
+        # Close the tab we created. On a tab/page split, closing the tab takes
+        # the page with it; closing only the page can leave the tab behind.
+        for stray in dict.fromkeys((created, tid)):
+            try: cdp("Target.closeTarget", targetId=stray)
+            except Exception: pass
         if previous and previous.get("targetId") and previous.get("targetId") != tid:
             try: switch_tab(previous)
             except Exception: pass
